@@ -1,0 +1,686 @@
+#!/usr/bin/env bash
+# bokador-link-vps-helper
+#
+# VPS side of the bokador-link kit (contract: docs/DESIGN.md, section 5).
+#
+# It records the heartbeat sent by the Windows client, decides whether the
+# link is up or down, tells the client whether a reverse-forwarded port is
+# listening, and installs the periodic check (systemd timer, or cron).
+#
+# Standard output is parsed by the client: every line printed there is part
+# of the contract. Every diagnostic goes to standard error.
+#
+# Line 2 of this file is a marker checked before the script removes itself
+# ("uninstall"): keep it where it is.
+
+set -euo pipefail
+
+LC_ALL=C
+export LC_ALL
+umask 022
+
+readonly BL_VERSION='1.0.0'
+readonly BL_MARKER='# bokador-link-vps-helper'
+readonly BL_SERVICE_UNIT='bokador-link-check.service'
+readonly BL_TIMER_UNIT='bokador-link-check.timer'
+readonly BL_DEFAULT_STALE_AFTER=600
+readonly BL_STALE_MIN=60
+readonly BL_STALE_MAX=86400
+readonly BL_NOTIFY_LIMIT=30
+readonly BL_PROBE_LIMIT=5
+
+# Validation patterns (same rules as the Windows side, DESIGN.md section 4.2).
+readonly BL_LABEL_RE='^[A-Za-z0-9._-]{1,64}$'
+readonly BL_SELF_RE='^/[A-Za-z0-9/._-]{1,200}$'
+readonly BL_EPOCH_RE='^[0-9]{1,12}$'
+readonly BL_PORT_RE='^[0-9]{1,5}$'
+readonly BL_STATUS_RE='^(up|down) ([0-9]{1,12})$'
+readonly BL_CONFIG_RE='^STALE_AFTER=([0-9]+)$'
+
+# BL_ROOT prefixes every path below (tests only; empty in production).
+BL_PREFIX="${BL_ROOT:-}"
+while [[ "$BL_PREFIX" == */ ]]; do
+    BL_PREFIX="${BL_PREFIX%/}"
+done
+readonly BL_PREFIX
+
+readonly STATE_DIR="$BL_PREFIX/var/lib/bokador-link"
+readonly HEARTBEAT_FILE="$STATE_DIR/heartbeat"
+readonly STATUS_FILE="$STATE_DIR/status"
+readonly CLIENT_FILE="$STATE_DIR/client"
+readonly ETC_DIR="$BL_PREFIX/etc/bokador-link"
+readonly CONFIG_FILE="$ETC_DIR/config"
+readonly NOTIFY_HOOK="$ETC_DIR/notify"
+readonly SYSTEMD_DIR="$BL_PREFIX/etc/systemd/system"
+readonly SERVICE_FILE="$SYSTEMD_DIR/$BL_SERVICE_UNIT"
+readonly TIMER_FILE="$SYSTEMD_DIR/$BL_TIMER_UNIT"
+readonly TIMER_WANTS_LINK="$SYSTEMD_DIR/timers.target.wants/$BL_TIMER_UNIT"
+readonly SYSTEMD_RUNTIME_DIR="$BL_PREFIX/run/systemd/system"
+readonly CRON_DIR="$BL_PREFIX/etc/cron.d"
+readonly CRON_FILE="$CRON_DIR/bokador-link"
+
+# Results handed back by the functions below (no command substitution, so
+# that an "exit" inside them really ends the script).
+NOW=0
+STALE_AFTER="$BL_DEFAULT_STALE_AFTER"
+FIRST_LINE=''
+HB_EPOCH=''
+ST_STATE='unknown'
+ST_SINCE=''
+SELF_PATH=''
+EVAL_STATE='unknown'
+EVAL_OLD='unknown'
+EVAL_AGE=0
+EVAL_CHANGED=0
+BL_TMP=''
+
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
+
+warn() {
+    printf 'bokador-link: %s\n' "$*" >&2
+}
+
+die() {
+    local code="$1"
+    shift
+    warn "$@"
+    exit "$code"
+}
+
+usage() {
+    printf '%s\n' \
+        'usage: bokador-link <commande>' \
+        '  version                affiche la version' \
+        '  install                installe la verification periodique (minuteur systemd, sinon cron)' \
+        '  uninstall [--purge]    supprime la verification periodique, les donnees et ce script' \
+        '                         (--purge : supprime aussi /etc/bokador-link)' \
+        '  heartbeat [etiquette]  enregistre un battement de coeur du client' \
+        '  probe-port <port>      teste une connexion TCP vers 127.0.0.1:<port> (1..65535)' \
+        '  status                 affiche le dernier etat connu de la liaison' \
+        '  check                  compare le dernier battement a STALE_AFTER (appele par le minuteur)' >&2
+}
+
+usage_error() {
+    usage
+    exit 2
+}
+
+# A temporary file left by an interrupted write_atomic() is removed on exit.
+trap '[[ -z "$BL_TMP" ]] || rm -f -- "$BL_TMP" 2>/dev/null || true' EXIT
+
+# Journal entry: syslog when "logger" works, standard error otherwise.
+log_event() {
+    if command -v logger >/dev/null 2>&1; then
+        if logger -t bokador-link "$1" >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    warn "$1"
+}
+
+require_root() {
+    if [[ -z "$BL_PREFIX" && "$EUID" -ne 0 ]]; then
+        die 3 'doit etre execute par root'
+    fi
+}
+
+# BL_NOW (tests only) replaces the clock.
+set_now() {
+    if [[ -n "${BL_NOW:-}" ]]; then
+        if [[ ! "$BL_NOW" =~ $BL_EPOCH_RE ]]; then
+            die 2 'BL_NOW invalide (epoque en secondes attendue)'
+        fi
+        NOW=$((10#$BL_NOW))
+        return 0
+    fi
+    NOW="$(date +%s)"
+    if [[ ! "$NOW" =~ $BL_EPOCH_RE ]]; then
+        die 1 'horloge illisible (date +%s)'
+    fi
+}
+
+# Atomic write: temporary file in the same directory, then rename.
+write_atomic() {
+    local target="$1" content="$2" dir
+    dir="${target%/*}"
+    BL_TMP="$(mktemp "$dir/.bokador-link.XXXXXX" 2>/dev/null)" \
+        || die 1 "ecriture impossible dans $dir"
+    if ! printf '%s\n' "$content" > "$BL_TMP"; then
+        die 1 "ecriture impossible : $target"
+    fi
+    chmod 644 "$BL_TMP" || die 1 "ecriture impossible : $target"
+    mv -f -- "$BL_TMP" "$target" || die 1 "ecriture impossible : $target"
+    BL_TMP=''
+}
+
+# Same, but leaves an identical file untouched (keeps "install" idempotent).
+write_if_changed() {
+    local target="$1" content="$2" existing=''
+    if [[ -f "$target" && ! -L "$target" && -r "$target" ]]; then
+        existing="$(< "$target")" || existing=''
+        if [[ "$existing" == "$content" ]]; then
+            return 0
+        fi
+    fi
+    write_atomic "$target" "$content"
+}
+
+# First line of a file into FIRST_LINE; status 1 when there is none.
+read_first_line() {
+    local file="$1"
+    FIRST_LINE=''
+    if [[ ! -f "$file" || ! -r "$file" ]]; then
+        return 1
+    fi
+    if ! IFS= read -r FIRST_LINE < "$file"; then
+        if [[ -z "$FIRST_LINE" ]]; then
+            return 1
+        fi
+    fi
+    FIRST_LINE="${FIRST_LINE%$'\r'}"
+    return 0
+}
+
+# Runs a command with a time limit. Exit status: the command's own, or 124
+# (137 when it had to be killed) when the limit is reached. Must be called
+# from a context where a non-zero status is handled ("if", "||").
+run_limited() {
+    local limit="$1" pid='' rc=0 tick=1 per_second=1 ticks=0
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout -k 5 "$limit" "$@" || rc=$?
+        return "$rc"
+    fi
+    # No "timeout" command: poll the child. Only the direct child is killed
+    # here (best effort), whereas timeout(1) signals its whole process group.
+    if sleep 0.1 2>/dev/null; then
+        tick=0.1
+        per_second=10
+    fi
+    "$@" &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if (( ticks >= limit * per_second )); then
+            kill -TERM "$pid" 2>/dev/null || true
+            sleep 1
+            kill -KILL "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            return 124
+        fi
+        sleep "$tick"
+        ticks=$((ticks + 1))
+    done
+    wait "$pid" || rc=$?
+    return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# Configuration and state files (parsed, never sourced)
+# ---------------------------------------------------------------------------
+
+# /etc/bokador-link/config: KEY=VALUE lines, the only key being STALE_AFTER.
+# Blank lines and "#" comments are skipped; anything else is reported and
+# ignored. The value is only ever handled as a string of digits.
+load_config() {
+    local line value number=0
+    STALE_AFTER="$BL_DEFAULT_STALE_AFTER"
+    if [[ ! -e "$CONFIG_FILE" ]]; then
+        return 0
+    fi
+    if [[ ! -f "$CONFIG_FILE" || ! -r "$CONFIG_FILE" ]]; then
+        warn "configuration illisible, valeurs par defaut : $CONFIG_FILE"
+        return 0
+    fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        number=$((number + 1))
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        if [[ -z "$line" || "$line" == '#'* ]]; then
+            continue
+        fi
+        if [[ "$line" =~ $BL_CONFIG_RE ]]; then
+            value="${BASH_REMATCH[1]}"
+            if (( ${#value} <= 9 )) \
+                && (( 10#$value >= BL_STALE_MIN )) \
+                && (( 10#$value <= BL_STALE_MAX )); then
+                STALE_AFTER=$((10#$value))
+            else
+                warn "configuration, ligne $number : STALE_AFTER hors limites ($BL_STALE_MIN..$BL_STALE_MAX), ignore"
+            fi
+        else
+            warn "configuration, ligne $number : ignoree (seule forme admise : STALE_AFTER=<secondes>)"
+        fi
+    done < "$CONFIG_FILE"
+    return 0
+}
+
+# Epoch of the last heartbeat into HB_EPOCH; status 1 when there is none.
+read_heartbeat() {
+    HB_EPOCH=''
+    if ! read_first_line "$HEARTBEAT_FILE"; then
+        return 1
+    fi
+    if [[ ! "$FIRST_LINE" =~ $BL_EPOCH_RE ]]; then
+        return 1
+    fi
+    HB_EPOCH=$((10#$FIRST_LINE))
+    return 0
+}
+
+# Recorded state into ST_STATE (up, down, unknown) and ST_SINCE.
+read_status() {
+    ST_STATE='unknown'
+    ST_SINCE=''
+    if ! read_first_line "$STATUS_FILE"; then
+        return 0
+    fi
+    if [[ "$FIRST_LINE" =~ $BL_STATUS_RE ]]; then
+        ST_STATE="${BASH_REMATCH[1]}"
+        ST_SINCE=$((10#${BASH_REMATCH[2]}))
+    fi
+    return 0
+}
+
+# A heartbeat (client) and a check (timer) can run at the same time: the
+# read-decide-write step is serialized with a lock on the state directory
+# when flock(1) exists. The lock is released before the notify hook runs.
+lock_state() {
+    if ! command -v flock >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! { exec 9< "$STATE_DIR"; } 2>/dev/null; then
+        return 0
+    fi
+    if ! flock -w 10 9 2>/dev/null; then
+        warn 'verrou indisponible, poursuite sans verrou'
+    fi
+    return 0
+}
+
+unlock_state() {
+    { exec 9<&-; } 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Check logic
+# ---------------------------------------------------------------------------
+
+# Decides up/down from the heartbeat age and records a change of state.
+# Never had a heartbeat: "unknown", nothing written, nothing announced.
+evaluate() {
+    local age=0 new='unknown'
+    EVAL_STATE='unknown'
+    EVAL_OLD='unknown'
+    EVAL_AGE=0
+    EVAL_CHANGED=0
+    if ! read_heartbeat; then
+        return 0
+    fi
+    lock_state
+    if ! read_heartbeat; then
+        unlock_state
+        return 0
+    fi
+    age=$((NOW - HB_EPOCH))
+    if (( age < 0 )); then
+        age=0
+    fi
+    if (( age <= STALE_AFTER )); then
+        new='up'
+    else
+        new='down'
+    fi
+    read_status
+    EVAL_OLD="$ST_STATE"
+    EVAL_STATE="$new"
+    EVAL_AGE="$age"
+    if [[ "$new" != "$ST_STATE" ]]; then
+        write_atomic "$STATUS_FILE" "$new $NOW"
+        EVAL_CHANGED=1
+    fi
+    unlock_state
+    return 0
+}
+
+# Optional hook: notify <up|down> <age>. Its failure never fails the command.
+run_notify() {
+    local state="$1" age="$2" rc=0
+    if [[ ! -e "$NOTIFY_HOOK" ]]; then
+        return 0
+    fi
+    if [[ ! -f "$NOTIFY_HOOK" || ! -x "$NOTIFY_HOOK" ]]; then
+        log_event "crochet notify ignore (fichier executable attendu) : $NOTIFY_HOOK"
+        return 0
+    fi
+    # The hook must not write to our standard output (client contract).
+    run_limited "$BL_NOTIFY_LIMIT" "$NOTIFY_HOOK" "$state" "$age" < /dev/null >&2 || rc=$?
+    if (( rc == 124 || rc == 137 )); then
+        log_event "crochet notify interrompu apres ${BL_NOTIFY_LIMIT} s (code $rc), ignore"
+    elif (( rc != 0 )); then
+        log_event "crochet notify en echec (code $rc), ignore"
+    fi
+    return 0
+}
+
+# Journal and hook, only when evaluate() recorded a change of state.
+announce() {
+    local client='-'
+    if (( EVAL_CHANGED != 1 )); then
+        return 0
+    fi
+    if read_first_line "$CLIENT_FILE"; then
+        if [[ "$FIRST_LINE" =~ $BL_LABEL_RE ]]; then
+            client="$FIRST_LINE"
+        fi
+    fi
+    log_event "liaison $EVAL_OLD -> $EVAL_STATE (age du battement : $EVAL_AGE s, client : $client)"
+    run_notify "$EVAL_STATE" "$EVAL_AGE"
+}
+
+# ---------------------------------------------------------------------------
+# Scheduler (systemd timer or cron)
+# ---------------------------------------------------------------------------
+
+# Absolute path of this script into SELF_PATH. This is the path written in
+# the systemd unit or the cron line; it is not prefixed by BL_ROOT.
+resolve_self() {
+    local path=''
+    path="$(readlink -f -- "$0" 2>/dev/null)" || path=''
+    if [[ -z "$path" || ! -f "$path" ]]; then
+        die 1 'chemin du script introuvable (lancer le fichier installe, pas un flux)'
+    fi
+    if [[ ! "$path" =~ $BL_SELF_RE ]]; then
+        die 1 'chemin du script refuse (caracteres admis : A-Z a-z 0-9 / . _ -, 200 au plus)'
+    fi
+    SELF_PATH="$path"
+}
+
+systemd_present() {
+    if [[ -d "$SYSTEMD_RUNTIME_DIR" ]] && command -v systemctl >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+# True when systemctl may be called (never with BL_NO_SYSTEMD=1).
+systemctl_usable() {
+    if [[ "${BL_NO_SYSTEMD:-}" == 1 ]]; then
+        return 1
+    fi
+    systemd_present
+}
+
+write_units() {
+    local service timer
+    service="[Unit]
+Description=bokador-link - verification du battement de coeur du client
+
+[Service]
+Type=oneshot
+ExecStart=$SELF_PATH check"
+    timer="[Unit]
+Description=bokador-link - verification periodique du battement de coeur
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=$BL_SERVICE_UNIT
+
+[Install]
+WantedBy=timers.target"
+    mkdir -p -- "$SYSTEMD_DIR" || die 1 "creation impossible : $SYSTEMD_DIR"
+    write_if_changed "$SERVICE_FILE" "$service"
+    write_if_changed "$TIMER_FILE" "$timer"
+}
+
+remove_units() {
+    if [[ ! -e "$SERVICE_FILE" && ! -e "$TIMER_FILE" \
+        && ! -L "$SERVICE_FILE" && ! -L "$TIMER_FILE" && ! -L "$TIMER_WANTS_LINK" ]]; then
+        return 0
+    fi
+    if systemctl_usable; then
+        systemctl disable --now "$BL_TIMER_UNIT" < /dev/null >&2 \
+            || warn "systemctl disable --now $BL_TIMER_UNIT a echoue (ignore)"
+    fi
+    rm -f -- "$TIMER_FILE" "$SERVICE_FILE" "$TIMER_WANTS_LINK" \
+        || die 1 "suppression impossible : $SYSTEMD_DIR/bokador-link-check.*"
+    if systemctl_usable; then
+        systemctl daemon-reload < /dev/null >&2 \
+            || warn 'systemctl daemon-reload a echoue (ignore)'
+    fi
+    return 0
+}
+
+write_cron() {
+    local content
+    if [[ ! -d "$CRON_DIR" ]]; then
+        warn "$CRON_DIR absent : cron ne semble pas installe, la verification periodique ne tournera pas sans lui"
+        mkdir -p -- "$CRON_DIR" || die 1 "creation impossible : $CRON_DIR"
+    fi
+    content="# Ecrit par \"bokador-link install\" ; retire par \"bokador-link uninstall\".
+*/5 * * * * root $SELF_PATH check"
+    write_if_changed "$CRON_FILE" "$content"
+}
+
+remove_cron() {
+    if [[ -e "$CRON_FILE" || -L "$CRON_FILE" ]]; then
+        rm -f -- "$CRON_FILE" || die 1 "suppression impossible : $CRON_FILE"
+    fi
+    return 0
+}
+
+# Removes this script, and only this script: the target must carry the
+# marker of line 2.
+remove_self() {
+    local path='' first='' second=''
+    path="$(readlink -f -- "$0" 2>/dev/null)" || path=''
+    if [[ -z "$path" || ! -f "$path" || ! -r "$path" ]]; then
+        warn 'chemin du script introuvable : fichier du script non supprime'
+        return 0
+    fi
+    {
+        IFS= read -r first || first=''
+        IFS= read -r second || second=''
+    } < "$path"
+    if [[ "$first" != '#!'* || "$second" != "$BL_MARKER" ]]; then
+        warn "$path n'est pas ce script : non supprime"
+        return 0
+    fi
+    rm -f -- "$path" || die 1 "suppression impossible : $path"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+cmd_install() {
+    local scheduler='cron'
+    if [[ $# -ne 0 ]]; then
+        usage_error
+    fi
+    resolve_self
+    if [[ ! -x "$SELF_PATH" ]]; then
+        die 1 "$SELF_PATH n'est pas executable (chmod 755)"
+    fi
+    mkdir -p -- "$STATE_DIR" "$ETC_DIR" || die 1 "creation impossible : $STATE_DIR, $ETC_DIR"
+
+    if [[ "${BL_FORCE_CRON:-}" == 1 ]]; then
+        scheduler='cron'
+    elif [[ "${BL_NO_SYSTEMD:-}" == 1 ]]; then
+        scheduler='units'
+    elif systemd_present; then
+        scheduler='systemd'
+    else
+        scheduler='cron'
+    fi
+
+    case "$scheduler" in
+        cron)
+            remove_units
+            write_cron
+            warn "verification periodique : cron ($CRON_FILE)"
+            ;;
+        units)
+            write_units
+            remove_cron
+            warn "verification periodique : unites systemd ecrites, systemctl non appele (BL_NO_SYSTEMD=1)"
+            ;;
+        systemd)
+            write_units
+            systemctl daemon-reload < /dev/null >&2 \
+                || die 1 'systemctl daemon-reload a echoue'
+            systemctl enable --now "$BL_TIMER_UNIT" < /dev/null >&2 \
+                || die 1 "systemctl enable --now $BL_TIMER_UNIT a echoue"
+            remove_cron
+            warn "verification periodique : minuteur systemd $BL_TIMER_UNIT"
+            ;;
+    esac
+    printf 'BOKADOR_LINK_INSTALLED %s\n' "$BL_VERSION"
+}
+
+cmd_uninstall() {
+    local purge=0
+    if [[ $# -eq 1 && "$1" == '--purge' ]]; then
+        purge=1
+    elif [[ $# -ne 0 ]]; then
+        usage_error
+    fi
+    remove_units
+    remove_cron
+    rm -rf -- "$STATE_DIR" || die 1 "suppression impossible : $STATE_DIR"
+    if (( purge == 1 )); then
+        rm -rf -- "$ETC_DIR" || die 1 "suppression impossible : $ETC_DIR"
+    fi
+    remove_self
+    printf 'BOKADOR_LINK_UNINSTALLED\n'
+}
+
+cmd_heartbeat() {
+    local label=''
+    if [[ $# -gt 1 ]]; then
+        warn 'heartbeat : arguments en trop, etiquette ignoree'
+    elif [[ $# -eq 1 ]]; then
+        if [[ "$1" =~ $BL_LABEL_RE ]]; then
+            label="$1"
+        else
+            warn 'heartbeat : etiquette invalide, ignoree'
+        fi
+    fi
+    set_now
+    load_config
+    if [[ ! -d "$STATE_DIR" ]]; then
+        mkdir -p -- "$STATE_DIR" || die 1 "creation impossible : $STATE_DIR"
+    fi
+    write_atomic "$HEARTBEAT_FILE" "$NOW"
+    if [[ -n "$label" ]]; then
+        write_atomic "$CLIENT_FILE" "$label"
+    fi
+    evaluate
+    # Answer first: a slow notify hook must not delay what the client reads.
+    printf 'BOKADOR_LINK_OK %s %s\n' "$NOW" "$EVAL_STATE"
+    announce
+}
+
+cmd_probe_port() {
+    local port=''
+    if [[ $# -ne 1 ]]; then
+        usage_error
+    fi
+    port="$1"
+    if [[ ! "$port" =~ $BL_PORT_RE ]] || (( 10#$port < 1 || 10#$port > 65535 )); then
+        warn 'probe-port : port invalide (entier 1..65535 attendu)'
+        exit 2
+    fi
+    # shellcheck disable=SC2016  # $1 belongs to the inner shell.
+    if run_limited "$BL_PROBE_LIMIT" "$BASH" -c 'exec 3<> "/dev/tcp/127.0.0.1/$1"' \
+        bokador-link-probe "$((10#$port))" < /dev/null > /dev/null 2>&1; then
+        printf 'PORT %s OPEN\n' "$port"
+        exit 0
+    fi
+    printf 'PORT %s CLOSED\n' "$port"
+    exit 1
+}
+
+cmd_status() {
+    local state='unknown' age='none' since='none'
+    if [[ $# -ne 0 ]]; then
+        usage_error
+    fi
+    set_now
+    load_config
+    if read_heartbeat; then
+        age=$((NOW - HB_EPOCH))
+        if (( age < 0 )); then
+            age=0
+        fi
+        read_status
+        state="$ST_STATE"
+        if [[ -n "$ST_SINCE" ]]; then
+            since="$ST_SINCE"
+        fi
+    fi
+    printf 'status=%s heartbeat_age=%s since=%s stale_after=%s version=%s\n' \
+        "$state" "$age" "$since" "$STALE_AFTER" "$BL_VERSION"
+}
+
+cmd_check() {
+    if [[ $# -ne 0 ]]; then
+        usage_error
+    fi
+    set_now
+    load_config
+    evaluate
+    announce
+}
+
+main() {
+    local command="${1:-}"
+    if [[ $# -gt 0 ]]; then
+        shift
+    fi
+    # The script refuses to run without root, "version" being the only
+    # exception (design section 5).
+    if [[ "$command" != version ]]; then
+        require_root
+    fi
+    case "$command" in
+        version)
+            if [[ $# -ne 0 ]]; then
+                usage_error
+            fi
+            printf 'bokador-link %s\n' "$BL_VERSION"
+            ;;
+        install)
+            cmd_install "$@"
+            ;;
+        uninstall)
+            cmd_uninstall "$@"
+            ;;
+        heartbeat)
+            cmd_heartbeat "$@"
+            ;;
+        probe-port)
+            cmd_probe_port "$@"
+            ;;
+        status)
+            cmd_status "$@"
+            ;;
+        check)
+            cmd_check "$@"
+            ;;
+        *)
+            usage_error
+            ;;
+    esac
+}
+
+# Single compound command: the whole file is parsed before anything runs, so
+# the script can remove or replace its own file safely.
+{
+    main "$@"
+    exit 0
+}

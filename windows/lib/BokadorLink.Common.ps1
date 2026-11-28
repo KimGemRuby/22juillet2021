@@ -688,7 +688,6 @@ function New-BLSshConfigText {
         '    IdentitiesOnly yes',
         '    BatchMode yes',
         '    PasswordAuthentication no',
-        '    KbdInteractiveAuthentication no',
         '    StrictHostKeyChecking yes',
         ('    UserKnownHostsFile ' + ($quoted.ToArray() -join ' ')),
         '    ServerAliveInterval 30',
@@ -1042,7 +1041,8 @@ function Invoke-BLSsh {
 }
 
 # Classifies a failed ssh call: network | auth | hostkey | timeout | unknown.
-# Only exit code 255 is an error of ssh itself; any other code comes from the remote command.
+# Only exit code 255 is classified as an error of ssh itself. ssh passes the exit code of the
+# remote command through, so 255 may also come from the remote command.
 function Get-BLClassifiedSshFailure {
     param(
         [Parameter(Mandatory = $true)]
@@ -1366,6 +1366,8 @@ function Test-BLTask {
             $notFound = $true
         }
         if (-not $notFound) {
+            # Unknown, not absent: Exists is $null so that no caller acts on a guess.
+            $result.Exists = $null
             $result.State = 'Unknown'
         }
         return $result
@@ -1446,6 +1448,11 @@ function Repair-BLTask {
             return $actions.ToArray()
         }
         $info = Test-BLTask -Name $Name
+        if ($null -eq $info.Exists) {
+            # The scheduler did not answer: a task is never registered on an unknown state.
+            Write-BLLog -Name $LogName -Level 'WARN' -Message ('Etat de la tache ' + $Name + ' inconnu (planificateur ne repond pas) : aucune reparation.')
+            return $actions.ToArray()
+        }
         if (-not $info.Exists) {
             $xmlPath = Join-Path $paths.Tasks ($Name + '.xml')
             if (-not [System.IO.File]::Exists($xmlPath)) {

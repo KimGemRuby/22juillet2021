@@ -107,7 +107,13 @@ try {
             if (-not [System.IO.Directory]::Exists($paths.Run)) {
                 [void][System.IO.Directory]::CreateDirectory($paths.Run)
             }
-            Write-BLPidFile -Path $paths.SupervisorPid -Process $selfProcess
+            try {
+                Write-BLPidFile -Path $paths.SupervisorPid -Process $selfProcess
+            }
+            catch {
+                # Not fatal (design 4.5): Invoke-PeriodicDuties writes the file again while it is missing.
+                Write-SupervisorLog -Level 'ERROR' -Message ('Ecriture de run\supervisor.pid impossible : ' + $_.Exception.Message)
+            }
         }
         $mutexText = 'aucun (creation refusee)'
         if ($null -ne $mutexInfo.Mutex) {

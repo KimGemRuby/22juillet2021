@@ -226,7 +226,8 @@ function Reset-Tunnel {
             return
         }
         $ageSec = ([DateTime]::UtcNow - $tunnel.StartTime.ToUniversalTime()).TotalSeconds
-        if (($ageSec -ge 0) -and ($ageSec -lt 20)) {
+        # A negative age (clock stepped back) also counts as young: the tunnel may still be connecting.
+        if ($ageSec -lt 20) {
             Write-WatchdogLog -Level 'INFO' -Message 'Tunnel tout juste lance : pas d''arret, nouvelle mesure a suivre.'
             return
         }

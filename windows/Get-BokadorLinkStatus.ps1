@@ -68,6 +68,17 @@ function Format-OrDash {
     return $text
 }
 
+# Existence of a task: 'inconnu' when the scheduler did not answer ($null).
+function Format-ExistsText {
+    param(
+        $Value
+    )
+    if ($null -eq $Value) {
+        return 'inconnu'
+    }
+    return (Format-YesNo -Value $Value)
+}
+
 $exitCode = 1
 try {
     $paths = Get-BLPaths
@@ -95,7 +106,18 @@ try {
     $state = Read-BLState
     $logTail = @(Get-BLFileTail -Path $paths.WatchdogLog -Count 10)
     $stopRequested = [System.IO.File]::Exists($paths.StopFlag)
-    $healthy = $installed -and ($null -ne $config) -and [bool]$state.Healthy
+    # state.json is written by the watchdog only: its healthy flag is trusted only while the last
+    # turn is recent (two watchdog periods plus the 150 s budget of one turn).
+    $lastRunUtc = ConvertTo-BLUtcDate -Value $state.LastRunUtc
+    $lastTurnFresh = $false
+    if (($null -ne $config) -and ($null -ne $lastRunUtc)) {
+        $turnAgeSec = ([DateTime]::UtcNow - $lastRunUtc).TotalSeconds
+        $allowedSec = (2 * [int]$config.WatchdogMinutes * 60) + 150
+        if ($turnAgeSec -le $allowedSec) {
+            $lastTurnFresh = $true
+        }
+    }
+    $healthy = $installed -and ($null -ne $config) -and [bool]$state.Healthy -and $lastTurnFresh
 
     if ($Json) {
         $report = [ordered]@{
@@ -162,8 +184,8 @@ try {
         }
         Write-Output ''
         Write-Output 'Taches planifiees'
-        Write-Output ('  ' + $names.Tunnel + '   : ' + $tunnelTask.State + ', existe=' + (Format-YesNo -Value $tunnelTask.Exists) + ', active=' + (Format-YesNo -Value $tunnelTask.Enabled))
-        Write-Output ('  ' + $names.Watchdog + ' : ' + $watchdogTask.State + ', existe=' + (Format-YesNo -Value $watchdogTask.Exists) + ', active=' + (Format-YesNo -Value $watchdogTask.Enabled))
+        Write-Output ('  ' + $names.Tunnel + '   : ' + $tunnelTask.State + ', existe=' + (Format-ExistsText -Value $tunnelTask.Exists) + ', active=' + (Format-YesNo -Value $tunnelTask.Enabled))
+        Write-Output ('  ' + $names.Watchdog + ' : ' + $watchdogTask.State + ', existe=' + (Format-ExistsText -Value $watchdogTask.Exists) + ', active=' + (Format-YesNo -Value $watchdogTask.Enabled))
         Write-Output ''
         Write-Output 'Processus suivis'
         if ($supervisorInfo.Running) {
@@ -183,8 +205,11 @@ try {
         }
         Write-Output ''
         Write-Output 'Etat (state.json)'
-        Write-Output ('  Sain                  : ' + (Format-YesNo -Value $state.Healthy))
+        Write-Output ('  Sain                  : ' + (Format-YesNo -Value $healthy))
         Write-Output ('  Dernier tour          : ' + (Format-OrDash -Value $state.LastRunUtc))
+        if ([bool]$state.Healthy -and (-not $lastTurnFresh)) {
+            Write-Output '  ATTENTION             : dernier tour trop ancien : le chien de garde ne tourne plus (tache desactivee ou en echec ?).'
+        }
         Write-Output ('  Dernier tour sain     : ' + (Format-OrDash -Value $state.LastOkUtc))
         Write-Output ('  Echecs consecutifs    : ' + $state.ConsecutiveFailures)
         Write-Output ('  Cause du dernier echec: ' + $state.LastFailureReason)

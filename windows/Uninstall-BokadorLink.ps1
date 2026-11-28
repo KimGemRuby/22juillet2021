@@ -45,6 +45,12 @@ function Remove-KitTasks {
     $remaining = 0
     foreach ($name in @($names.Watchdog, $names.Tunnel)) {
         $info = Test-BLTask -Name $name
+        if ($null -eq $info.Exists) {
+            # The scheduler did not answer: the task is not known to be gone, so it counts as remaining.
+            Write-Step -Level 'WARN' -Message ('Etat de la tache ' + $name + ' inconnu (planificateur ne repond pas).')
+            $remaining++
+            continue
+        }
         if (-not $info.Exists) {
             continue
         }
@@ -62,7 +68,7 @@ function Remove-KitTasks {
             Write-Step -Level 'WARN' -Message ('Suppression de la tache ' + $name + ' : ' + $_.Exception.Message)
         }
         $after = Test-BLTask -Name $name
-        if ($after.Exists) {
+        if ($after.State -ne 'Absent') {
             $remaining++
         }
     }
@@ -128,7 +134,8 @@ function Get-RootRefusal {
     if ([System.IO.Directory]::Exists((Join-Path $root '.git'))) {
         return 'depot git'
     }
-    $markers = @($Paths.Config, $Paths.CommonLib, $Paths.SupervisorScript, $Paths.State, $Paths.Logs)
+    # known_hosts: the first-contact pin of a run that stopped at exit 2 is the only kit file then.
+    $markers = @($Paths.Config, $Paths.CommonLib, $Paths.SupervisorScript, $Paths.State, $Paths.Logs, $Paths.KnownHosts)
     foreach ($marker in $markers) {
         if ([System.IO.File]::Exists($marker) -or [System.IO.Directory]::Exists($marker)) {
             return ''
@@ -145,13 +152,21 @@ try {
 
     # The configuration is read first: it is needed for the VPS side.
     $config = $null
+    $configError = ''
+    $rawConfig = $null
     if ([System.IO.File]::Exists($paths.Config)) {
+        # The raw content (when it parses) tells whether the VPS side may be installed, even
+        # when the validated configuration cannot be read (a missing key file, for example).
+        $rawConfig = Read-BLJsonFile -Path $paths.Config
         try {
             $config = Read-BLConfig
         }
         catch {
-            Write-Step -Level 'WARN' -Message ('Configuration illisible, le cote VPS ne sera pas traite : ' + $_.Exception.Message)
+            $configError = [string]$_.Exception.Message
         }
+    }
+    else {
+        $configError = 'configuration introuvable : ' + $paths.Config
     }
 
     # 1. stop flag: the supervisor ends by itself, and no repair resurrects a task.
@@ -188,7 +203,31 @@ try {
         Write-Step -Message '-KeepVps : le cote VPS est conserve.'
     }
     elseif ($null -eq $config) {
-        Write-Step -Message 'Pas de configuration valide : rien a faire cote VPS.'
+        # The VPS side cannot be reached through the kit. It counts as an error when it may still
+        # be installed, and the exact command to run by hand on the VPS is shown.
+        $helperPath = '/usr/local/sbin/bokador-link'
+        $mayBeInstalled = $true
+        if ($null -ne $rawConfig) {
+            $rawHelper = [string](Get-BLProperty -Object $rawConfig -Name 'VpsHelper' -Default '')
+            if ($rawHelper -match '^/[A-Za-z0-9/._\-]{1,200}$') {
+                $helperPath = $rawHelper
+            }
+            $mayBeInstalled = [bool](Get-BLProperty -Object $rawConfig -Name 'VpsSideInstalled' -Default $true)
+        }
+        if (-not $rootExists) {
+            Write-Step -Message 'Aucune installation : rien a faire cote VPS.'
+        }
+        elseif (-not [System.IO.File]::Exists($paths.Config)) {
+            # The kit writes config.json before it pushes the VPS helper: without the file, the VPS
+            # side is unknown rather than known to be installed (a warning, not an error).
+            Write-Step -Level 'WARN' -Message ('Pas de configuration : cote VPS inconnu. Si l''assistant y est installe, le lancer a la main : ' + $helperPath + ' uninstall')
+        }
+        elseif ($mayBeInstalled) {
+            Write-Step -Level 'ERROR' -Message ('Cote VPS non traite (' + $configError + ') : a faire a la main sur le VPS : ' + $helperPath + ' uninstall')
+        }
+        else {
+            Write-Step -Message 'Cote VPS non installe selon la configuration : rien a faire sur le VPS.'
+        }
     }
     elseif (-not $config.VpsSideInstalled) {
         Write-Step -Message 'Cote VPS non installe : rien a faire sur le VPS.'
@@ -222,6 +261,11 @@ try {
     # 6. installation directory.
     if (-not $rootExists) {
         Write-Step -Message 'Repertoire d''installation absent : rien a supprimer.'
+    }
+    elseif ($remainingTasks -gt 0) {
+        # Kept on purpose: the tasks still exist and would fail on missing scripts. Run this
+        # script again once they are gone.
+        Write-Step -Message ('Repertoire conserve tant que des taches planifiees existent : ' + $paths.Root)
     }
     else {
         $refusal = Get-RootRefusal -Paths $paths

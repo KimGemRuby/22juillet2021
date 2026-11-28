@@ -135,9 +135,14 @@ function Test-KeyCandidate {
         [Parameter(Mandatory = $true)]
         [string]$Target,
         [Parameter(Mandatory = $true)]
-        [int]$Port
+        [int]$Port,
+        [Parameter(Mandatory = $true)]
+        [string]$ConfigPath
     )
     $arguments = New-Object 'System.Collections.Generic.List[string]'
+    # -F with an empty file: the user's ~/.ssh/config is never read (design 4.3).
+    $arguments.Add('-F')
+    $arguments.Add($ConfigPath)
     foreach ($item in @('-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes', '-o', 'ConnectTimeout=10')) {
         $arguments.Add($item)
     }
@@ -168,6 +173,15 @@ function Test-KeyCandidate {
     }
     else {
         $outcome.Detail = 'code de sortie ' + $result.ExitCode
+    }
+    # ssh.exe ignores a private key whose file permissions are too open, then reports
+    # "Permission denied": that cause is local, not a refusal by the VPS.
+    foreach ($line in $errorLines) {
+        if ($line -match 'UNPROTECTED PRIVATE KEY FILE|This private key will be ignored|[Bb]ad permissions') {
+            $outcome.Cause = 'local'
+            $outcome.Detail = [string]$line
+            break
+        }
     }
     return $outcome
 }
@@ -244,6 +258,10 @@ function Remove-KitTasks {
     $names = Get-BLTaskNames
     foreach ($name in @($names.Watchdog, $names.Tunnel)) {
         $info = Test-BLTask -Name $name
+        if ($null -eq $info.Exists) {
+            Write-Step -Level 'WARN' -Message ('Etat de la tache ' + $name + ' inconnu (planificateur ne repond pas) : tache non arretee.')
+            continue
+        }
         if (-not $info.Exists) {
             continue
         }
@@ -386,6 +404,8 @@ catch {
 
 $exitCode = 1
 $tempDir = $null
+# True while run\stop.flag is written by this run (see the finally block).
+$stopFlagHeld = $false
 try {
     if ([Environment]::Is64BitOperatingSystem -and (-not [Environment]::Is64BitProcess)) {
         Write-Step -Level 'ERROR' -Message 'Lancer l''installateur depuis un PowerShell 64 bits (le client OpenSSH n''est pas visible en 32 bits).'
@@ -478,22 +498,41 @@ try {
     }
     $hostKeyOptions = New-Object 'System.Collections.Generic.List[string]'
     $tempKnownHosts = ''
+    # Temporary directory of this run: the empty ssh configuration of step 2 and the first
+    # contact known_hosts. Removed by the finally block.
+    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ('bokador-link-' + [Guid]::NewGuid().ToString('N'))
+    [void][System.IO.Directory]::CreateDirectory($tempDir)
+    $emptyConfig = Join-Path $tempDir 'empty_ssh_config'
+    [System.IO.File]::WriteAllText($emptyConfig, '', (Get-BLUtf8NoBom))
+    $tempKnownHosts = Join-Path $tempDir 'known_hosts'
     $hostKeyOptions.Add('-o')
     if ($hostKnownByUser) {
         Write-Step -Message '[3/7] Cle d''hote deja connue dans le known_hosts de l''utilisateur : verification stricte.'
         $hostKeyOptions.Add('StrictHostKeyChecking=yes')
     }
     else {
-        # First contact (trust on first use). The key is recorded in a temporary file,
-        # seeded with the kit's own known_hosts so that a changed key is still refused.
-        Write-Step -Message '[3/7] Cle d''hote inconnue de l''utilisateur : premier contact (accept-new) dans le known_hosts du kit.'
-        $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ('bokador-link-' + [Guid]::NewGuid().ToString('N'))
-        [void][System.IO.Directory]::CreateDirectory($tempDir)
-        $tempKnownHosts = Join-Path $tempDir 'known_hosts'
+        # First contact (trust on first use). The key is recorded in a temporary file seeded
+        # with the kit's known_hosts; it is copied to the kit's known_hosts once learned (below).
         if ([System.IO.File]::Exists($paths.KnownHosts)) {
             [System.IO.File]::Copy($paths.KnownHosts, $tempKnownHosts, $true)
         }
-        $hostKeyOptions.Add('StrictHostKeyChecking=accept-new')
+        # A host already pinned in the kit's known_hosts is checked strictly: a new key type must
+        # not be accepted silently (design 4.6, step 3: accept-new is for unknown hosts only).
+        $kitPinned = $false
+        if ([System.IO.File]::Exists($tempKnownHosts)) {
+            $pin = Invoke-BLNative -FilePath $sshKeygenExe -ArgumentList @('-F', $hostSpec, '-f', $tempKnownHosts) -TimeoutSec 20
+            if (($pin.ExitCode -eq 0) -and (([string]$pin.StdOut).Trim().Length -gt 0)) {
+                $kitPinned = $true
+            }
+        }
+        if ($kitPinned) {
+            Write-Step -Message '[3/7] Cle d''hote deja enregistree dans le known_hosts du kit : verification stricte.'
+            $hostKeyOptions.Add('StrictHostKeyChecking=yes')
+        }
+        else {
+            Write-Step -Message '[3/7] Cle d''hote inconnue de l''utilisateur : premier contact (accept-new).'
+            $hostKeyOptions.Add('StrictHostKeyChecking=accept-new')
+        }
         $hostKeyOptions.Add('-o')
         $hostKeyOptions.Add('UserKnownHostsFile="' + (ConvertTo-BLSshPath -Path $tempKnownHosts) + '"')
     }
@@ -546,13 +585,16 @@ try {
     $authFailures = 0
     $otherFailure = ''
     foreach ($candidate in $candidates) {
-        $test = Test-KeyCandidate -KeyPath $candidate -SshExe $sshExe -HostKeyOptions $hostKeyOptions.ToArray() -Target $target -Port $VpsPort
+        $test = Test-KeyCandidate -KeyPath $candidate -SshExe $sshExe -HostKeyOptions $hostKeyOptions.ToArray() -Target $target -Port $VpsPort -ConfigPath $emptyConfig
         if ($test.Works) {
             Write-Step -Message ('    ' + $candidate + ' : fonctionne.')
             $chosenKey = $candidate
             break
         }
         Write-Step -Message ('    ' + $candidate + ' : refusee (' + $test.Cause + ') ' + $test.Detail)
+        if ($test.Cause -eq 'local') {
+            Write-Step -Level 'WARN' -Message '    Droits du fichier de cle trop ouverts : le reserver a votre compte Windows, puis relancer. Ce n''est pas un refus du VPS.'
+        }
         if ($test.Cause -eq 'hostkey') {
             Write-Step -Level 'ERROR' -Message 'La cle d''hote du VPS ne correspond pas a celle deja enregistree. Installation arretee.'
             Write-Step -Message 'Verifier l''empreinte du serveur avant toute chose ; le kit n''accepte jamais une cle d''hote modifiee.'
@@ -570,6 +612,14 @@ try {
         }
     }
 
+    # The pin learned by the first contact goes to the kit's known_hosts now: it must survive an
+    # exit 2 (the key has to be authorized on the VPS first) and be compared by later runs.
+    if ((-not $hostKnownByUser) -and (-not $DryRun) -and [System.IO.File]::Exists($tempKnownHosts)) {
+        if (-not [System.IO.Directory]::Exists($paths.Root)) {
+            [void][System.IO.Directory]::CreateDirectory($paths.Root)
+        }
+        [System.IO.File]::Copy($tempKnownHosts, $paths.KnownHosts, $true)
+    }
     if ((-not $hostKnownByUser) -and [System.IO.File]::Exists($tempKnownHosts)) {
         $fingerprint = Invoke-BLNative -FilePath $sshKeygenExe -ArgumentList @('-l', '-f', $tempKnownHosts) -TimeoutSec 20
         $fingerprintLines = @(Get-TextLines -Text ([string]$fingerprint.StdOut))
@@ -622,6 +672,17 @@ try {
 
     $draft.IdentityFile = $chosenKey
     $pushHelper = (-not $SkipVps) -and ($VpsUser -ceq 'root')
+    # What the previous installation recorded: an existing VPS assistant stays in use when this run
+    # does not reinstall it (-SkipVps, non-root user, failed push), as long as it is the same VPS.
+    $previousVpsSide = $false
+    $previousRaw = Read-BLJsonFile -Path $paths.Config
+    if ($null -ne $previousRaw) {
+        $samePort = (([string](Get-BLProperty -Object $previousRaw -Name 'VpsPort' -Default '')) -eq ([string]$VpsPort))
+        $sameHost = (([string](Get-BLProperty -Object $previousRaw -Name 'VpsHost' -Default '')) -ieq $VpsHost)
+        if ($samePort -and $sameHost) {
+            $previousVpsSide = [bool](Get-BLProperty -Object $previousRaw -Name 'VpsSideInstalled' -Default $false)
+        }
+    }
 
     if ($DryRun) {
         Write-Step -Message 'Ce qui serait fait sans -DryRun :'
@@ -645,6 +706,7 @@ try {
             [void][System.IO.Directory]::CreateDirectory($paths.Run)
         }
         [System.IO.File]::WriteAllText($paths.StopFlag, (Get-BLUtcNowText), (Get-BLUtf8NoBom))
+        $stopFlagHeld = $true
     }
     Remove-KitTasks -StopOnly
     $stopWatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -665,7 +727,9 @@ try {
         }
     }
     # From here on the stop flag guards the whole installation, and messages are logged.
+    # If the installation fails before the tunnel starts again, the finally block removes it.
     [System.IO.File]::WriteAllText($paths.StopFlag, (Get-BLUtcNowText), (Get-BLUtf8NoBom))
+    $stopFlagHeld = $true
     $script:LogEnabled = $true
     Write-BLLog -Name 'install' -Level 'INFO' -Message ('Installation vers ' + $paths.Root + ', cible ' + $target + ' port ' + $VpsPort + ', cle ' + $chosenKey)
 
@@ -695,12 +759,12 @@ try {
     }
 
     # --- Step 5: VPS side ------------------------------------------------------------
-    $vpsSideInstalled = $false
+    $vpsSideInstalled = $previousVpsSide
     if ($SkipVps) {
-        Write-Step -Message '[5/7] -SkipVps : rien n''est installe sur le VPS (sonde simple).'
+        Write-Step -Message '[5/7] -SkipVps : aucune installation sur le VPS.'
     }
     elseif (-not $pushHelper) {
-        Write-Step -Level 'WARN' -Message ('[5/7] L''utilisateur ' + $VpsUser + ' n''est pas root : cote VPS non installe (sonde simple).')
+        Write-Step -Level 'WARN' -Message ('[5/7] L''utilisateur ' + $VpsUser + ' n''est pas root : cote VPS non installe.')
     }
     else {
         Write-Step -Message ('[5/7] Installation de l''assistant sur le VPS : ' + [string]$config.VpsHelper)
@@ -714,8 +778,13 @@ try {
         }
         else {
             Write-Step -Level 'WARN' -Message ('    Installation cote VPS en echec (code ' + $push.ExitCode + ') : ' + ([string]$push.StdErr).Trim())
-            Write-Step -Level 'WARN' -Message '    Le chien de garde utilisera la sonde simple.'
         }
+    }
+    if ($vpsSideInstalled) {
+        Write-Step -Message ('    Assistant VPS actif (battements de coeur) : ' + [string]$config.VpsHelper)
+    }
+    else {
+        Write-Step -Level 'WARN' -Message '    Pas d''assistant sur le VPS : le chien de garde utilisera la sonde simple.'
     }
     $draft.VpsSideInstalled = $vpsSideInstalled
 
@@ -744,6 +813,7 @@ try {
     # --- Step 7: start and verify --------------------------------------------------------
     Write-Step -Message '[7/7] Demarrage du tunnel.'
     [System.IO.File]::Delete($paths.StopFlag)
+    $stopFlagHeld = $false
     Start-ScheduledTask -TaskName $names.Tunnel -TaskPath '\' -ErrorAction Stop
     $started = Wait-TunnelStart -Paths $paths -TimeoutSec 45
     if ((-not $started.Supervisor) -and ($taskMode -eq 'S4U')) {
@@ -751,6 +821,7 @@ try {
         # right): same fallback as a refusal at registration.
         Write-Step -Level 'WARN' -Message '    La tache S4U ne demarre pas : repli sur le mode Interactive.'
         [System.IO.File]::WriteAllText($paths.StopFlag, (Get-BLUtcNowText), (Get-BLUtf8NoBom))
+        $stopFlagHeld = $true
         Remove-KitTasks
         $taskMode = 'Interactive'
         Register-KitTasks -Mode 'Interactive' -Paths $paths -UserId $userId -Minutes $WatchdogMinutes
@@ -759,6 +830,7 @@ try {
         Write-BLConfig -Config $draft
         $config = Read-BLConfig
         [System.IO.File]::Delete($paths.StopFlag)
+        $stopFlagHeld = $false
         Start-ScheduledTask -TaskName $names.Tunnel -TaskPath '\' -ErrorAction Stop
         $started = Wait-TunnelStart -Paths $paths -TimeoutSec 45
     }
@@ -820,6 +892,17 @@ finally {
         catch {
             Write-Host ('ATTENTION : repertoire temporaire non supprime : ' + $tempDir)
         }
+    }
+    if ($stopFlagHeld) {
+        # The installation did not reach the start of the tunnel: the stop flag must not keep the
+        # link down. The watchdog repairs the link on its next turn (design 4.5).
+        try {
+            [System.IO.File]::Delete($paths.StopFlag)
+        }
+        catch {
+            Write-Host ('ATTENTION : run\stop.flag non supprime : ' + $paths.StopFlag)
+        }
+        $stopFlagHeld = $false
     }
 }
 exit $exitCode

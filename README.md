@@ -5,7 +5,8 @@
 Kit qui établit et maintient une liaison SSH **permanente, persistante et auto-réparatrice**
 entre un PC Windows (le client, « bokador ») et un VPS Linux.
 
-- Le PC ouvre la connexion vers le VPS et la garde ouverte. Aucun port n'est ouvert sur le PC.
+- Le PC ouvre la connexion vers le VPS et la garde ouverte. Aucun port entrant n'est ouvert sur
+  le PC ; seule l'option `-Forward L` crée une écoute, en boucle locale (127.0.0.1).
 - Si la liaison tombe (coupure réseau, redémarrage du VPS ou du PC, mise en veille,
   `ssh.exe` planté), elle se rétablit seule.
 - Deux boucles se surveillent mutuellement : un **superviseur** (processus long qui relance
@@ -16,8 +17,9 @@ entre un PC Windows (le client, « bokador ») et un VPS Linux.
 
 La conception détaillée est dans [`docs/DESIGN.md`](docs/DESIGN.md).
 
-> **État** : conception et outillage de test en place. Les scripts décrits ci-dessous sont
-> en cours d'implémentation sur cette branche ; n'exécutez rien avant leur arrivée.
+> **État** : en revue (travail en cours, pas encore validé). Les scripts PowerShell sont présents
+> dans `windows/` ; aucun test automatisé de ce dépôt ne les exécute. L'installateur fait une
+> analyse syntaxique réelle avant toute modification.
 
 ### Prérequis
 
@@ -39,26 +41,28 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Install-BokadorLink.ps1 -V
 L'installateur :
 
 1. vérifie la syntaxe de tous les scripts avant de modifier quoi que ce soit ;
-2. cherche dans `%USERPROFILE%\.ssh` une clé qui ouvre déjà le VPS (aucune clé n'est copiée ni affichée) ;
+2. cherche dans `%USERPROFILE%\.ssh` une clé qui ouvre déjà le VPS (aucune clé existante n'est copiée
+   ni affichée ; si le VPS refuse toutes ces clés, une clé neuve est créée et sa clé publique est affichée) ;
 3. vérifie la clé d'hôte du VPS ;
 4. installe le kit dans `%LOCALAPPDATA%\BokadorLink` ;
 5. dépose l'assistant `bokador-link` sur le VPS et active son minuteur ;
 6. crée deux tâches planifiées, `BokadorLink-Tunnel` et `BokadorLink-Watchdog` ;
 7. démarre la liaison, fait un premier tour de contrôle et affiche l'état.
 
-Lancé dans un PowerShell **administrateur**, il enregistre les tâches en mode S4U : la
-liaison démarre au démarrage de Windows, sans session ouverte. Sinon, elle démarre à
-l'ouverture de session.
+L'installateur tente d'abord le mode S4U : la liaison démarre au démarrage de Windows, sans
+session ouverte. Si Windows refuse ce mode, ou si la tâche ne démarre pas, il se rabat sur le
+mode Interactive : la liaison démarre à l'ouverture de session.
 
 Options utiles :
 
 | Option | Effet |
 |---|---|
 | `-VpsUser root` `-VpsPort 22` | utilisateur et port SSH du VPS |
-| `-IdentityFile C:\chemin\cle` | impose la clé à utiliser |
+| `-IdentityFile C:\chemin\cle` | la liaison n'utilise que cette clé ; si elle est refusée, l'installateur peut créer une nouvelle clé et demande de l'autoriser sur le VPS |
 | `-Forward "R 127.0.0.1:33389 127.0.0.1:3389"` | redirection de port à maintenir (répétable ; boucle locale uniquement). `R` : un port du VPS mène au PC. `L` : un port du PC mène au VPS |
 | `-WatchdogMinutes 3` | période du chien de garde |
-| `-SkipVps` | n'installe rien sur le VPS |
+| `-SkipVps` | n'installe rien sur le VPS (un assistant déjà installé reste en service) |
+| `-InteractiveOnly` | n'essaie pas le mode S4U : démarrage à l'ouverture de session seulement |
 | `-DryRun` | décrit ce qui serait fait, sans rien modifier |
 
 Codes de sortie : `0` liaison saine, `1` échec, `2` une clé doit être autorisée sur le VPS
@@ -78,6 +82,9 @@ Sur le VPS :
 bokador-link status
 ```
 
+Avec `-Json`, la même commande affiche l'état en JSON. L'état n'est « sain » que si le dernier
+tour du chien de garde est récent ; sinon la commande le signale et sort avec le code `1`.
+
 Les journaux du PC sont dans `%LOCALAPPDATA%\BokadorLink\logs`.
 
 Pour être prévenu quand le PC ne répond plus, créez sur le VPS un exécutable
@@ -92,6 +99,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\BokadorLi
 
 Les deux tâches, le dossier d'installation et l'assistant côté VPS sont supprimés. Vos clés
 SSH, votre `~\.ssh\config` et votre `known_hosts` ne sont jamais touchés.
+
+Options : `-KeepVps` ne touche pas à l'assistant du VPS ; `-KeepLogs` conserve le dossier `logs`.
+
+Si quelque chose reste en place, la désinstallation se termine avec le code `1`. Par exemple, une
+tâche planifiée ne peut pas être supprimée : le dossier est alors conservé, relancez la
+désinstallation ensuite. Ou la configuration est illisible (clé déplacée, par exemple) alors que
+l'assistant du VPS peut être installé : la commande à lancer à la main sur le VPS est affichée.
 
 ### Ce que le kit ne fait pas
 

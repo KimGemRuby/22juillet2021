@@ -55,7 +55,7 @@ docs/DESIGN.md                       ce document
   destinés à l'utilisateur sont en français sans accents.
 - Style conventionnel multi-lignes : un `param(...)` par bloc sur ses propres lignes,
   accolade ouvrante en fin de ligne, `else`/`catch`/`finally` sur une nouvelle ligne ou
-  après `}`. (Le contrôle statique `tests/ps-static-check.py` s'appuie sur ce style.)
+  après `}`. (Ce style n'est pas contrôlé automatiquement.)
 - `Set-StrictMode -Version 2.0` et `$ErrorActionPreference = 'Stop'` en tête de chaque script.
 - Tout exécutable natif dont on lit la sortie ou dont on borne la durée passe par
   `Invoke-BLNative` (jamais de pipeline PowerShell vers `ssh.exe` : PS 5.1 y injecterait
@@ -344,6 +344,8 @@ ci-dessous, vide par défaut), `BL_NO_SYSTEMD=1` (écrit les unités mais n'appe
 Choix du planificateur par `install` : `BL_FORCE_CRON=1` → cron ; sinon `BL_NO_SYSTEMD=1` →
 unités écrites sans `systemctl` ; sinon systemd présent (`/run/systemd/system` et
 `systemctl`) → unités + `systemctl daemon-reload` + `enable --now` du minuteur ; sinon cron.
+Le repli cron exige le répertoire `/etc/cron.d` (présent dès que cron est installé) : sans
+lui, `install` échoue (code 1) avant d'écrire quoi que ce soit.
 
 Le script s'installe là où le client l'a déposé (`VpsHelper`, par défaut
 `/usr/local/sbin/bokador-link`) : `install` résout son propre chemin absolu
@@ -368,7 +370,7 @@ Sous-commandes (sortie standard = contrat lu par le client ; diagnostics sur std
 | Commande | Effet | Sortie / code |
 |---|---|---|
 | `version` | — | `bokador-link <version>` / 0 |
-| `install` | crée les répertoires, écrit et active le minuteur systemd (ou cron), idempotent | dernière ligne `BOKADOR_LINK_INSTALLED <version>` / 0 |
+| `install` | crée les répertoires, écrit et active le minuteur systemd (ou cron), idempotent ; sans systemd ni `/etc/cron.d`, rien n'est écrit | dernière ligne `BOKADOR_LINK_INSTALLED <version>` / 0 ; sans systemd ni `/etc/cron.d` : 1, sans cette ligne |
 | `uninstall [--purge]` | désactive et supprime minuteur/cron, supprime `/var/lib/bokador-link`, (`--purge` : aussi `/etc/bokador-link`), se supprime en dernier | `BOKADOR_LINK_UNINSTALLED` / 0 |
 | `heartbeat [étiquette]` | écrit `heartbeat` (atomique), `client` si l'étiquette respecte `^[A-Za-z0-9._-]{1,64}$`, puis exécute la logique de `check` | `BOKADOR_LINK_OK <époque> <up\|down\|unknown>` / 0 |
 | `probe-port <port>` | port numérique 1..65535, connexion TCP à `127.0.0.1:<port>`, délai 5 s | `PORT <port> OPEN` / 0 ou `PORT <port> CLOSED` / 1 ; argument invalide : 2 |
@@ -377,6 +379,8 @@ Sous-commandes (sortie standard = contrat lu par le client ; diagnostics sur std
 
 Toute commande inconnue : usage sur stderr, code 2. Le script refuse de s'exécuter si
 `BL_ROOT` est vide et que l'utilisateur n'est pas root (code 3), sauf pour `version`.
+L'ordre des contrôles est donc : commande connue (code 2), puis root (code 3) ; une
+commande inconnue est une erreur d'usage quel que soit l'utilisateur.
 
 Ainsi chaque extrémité vérifie l'autre : le PC lit `up|down|unknown` dans la réponse au
 battement (champ `VpsView`), et le VPS détecte seul un PC silencieux via son minuteur.
@@ -388,18 +392,41 @@ battement (champ `VpsView`), et le VPS détecte seul un PC silencieux via son mi
   et `BL_NOW` (formats de sortie exacts, transitions `unknown → up → down → up`, crochet
   `notify`, étiquettes et ports invalides, idempotence d'`install`, `uninstall`).
 - `tests/test-integration.sh` : démarre un `sshd` jetable sur `127.0.0.1` (port libre, clés
-  temporaires, `SetEnv BL_ROOT=… BL_NO_SYSTEMD=1`), puis rejoue **exactement** les commandes
-  distantes du client Windows : envoi par stdin + `install`, `heartbeat`, `status`,
+  temporaires, `SetEnv BL_ROOT=… BL_NO_SYSTEMD=1 PATH=…`), puis rejoue **exactement** les
+  commandes distantes du client Windows : envoi par stdin + `install`, `heartbeat`, `status`,
   `probe-port` fermé, ouverture d'un tunnel inverse `ssh -N -R` puis `probe-port` ouvert,
-  mort du tunnel puis port refermé, battement périmé puis `down` et crochet appelé.
+  mort du tunnel puis port refermé, battement périmé puis `down` et crochet appelé. Son
+  `ssh_config` client est recopié à la main de §4.3 ; le test vérifie que ses mots-clés sont
+  ceux de §4.3, dans le même ordre.
 - `tests/ps-static-check.py` : fichiers `.ps1` en ASCII pur ; pas de jeton réservé à
-  PowerShell 7 ; analyse syntaxique (grammaire tree-sitter, heuristique : ce n'est pas
-  l'analyseur de PowerShell) ; chaque fonction `*-BL*` appelée est définie dans la
-  bibliothèque commune ; chaque nom de fichier/tâche du §4 utilisé de façon cohérente.
+  PowerShell 7, dont `ConvertFrom-Json -Depth` ; analyse syntaxique avec la grammaire
+  tree-sitter (heuristique : ce n'est pas l'analyseur de PowerShell). Cette grammaire est
+  **obligatoire** : sans elle, l'étape échoue (`pip install tree-sitter tree-sitter-powershell`) ;
+  chaque fonction `*-BL*` appelée, verbes composés compris (`ConvertTo-BL*`), est définie dans
+  la bibliothèque commune ou dans le fichier appelant ; chaque nom de fichier qui porte une
+  extension du kit (`.ps1`, `.vbs`, `.json`, `.log`, `.xml`, `.pid`, `.flag`) figure au §4 ; les
+  mots-clés du `ssh_config` produit par `New-BLSshConfigText` sont ceux du §4.3, dans le même ordre.
 
 Limite connue : les scripts PowerShell ne sont **pas exécutés** par ces tests (pas de
 PowerShell ni de Planificateur de tâches sous Linux ici). L'étape 0 de l'installateur
-refait une vraie analyse syntaxique sur la machine cible avant toute modification.
+refait une vraie analyse syntaxique sur la machine cible avant toute modification. La
+classification des échecs ssh (`Get-BLClassifiedSshFailure`, §4.4) n'est pas exécutée non
+plus : les tests vérifient seulement le code de sortie 255 et le texte de stderr produit par ssh.
+
+Limites connues, décisions en attente (le code se comporte comme décrit) :
+
+- Le crochet `notify` s'exécute pendant `heartbeat`, après la ligne `BOKADOR_LINK_OK` : la
+  session ssh du client ne se termine qu'à la fin du crochet (au plus 30 s, plus la marge
+  d'arrêt). Le détacher demande de décider où son journal est écrit, car la session peut
+  disparaître avec elle.
+- Un `ssh.exe` bloqué sans quitter n'est pas détecté : `probe-port` vérifie seulement que le
+  VPS accepte la connexion TCP, et le chien de garde ne fait pas circuler de données dans le
+  tunnel (§4.5).
+- Un saut d'horloge du VPS peut produire une paire `down` / `up` parasite, ou laisser `up`
+  pendant un retour en arrière (un âge négatif est ramené à 0).
+- Les variables réservées aux tests (`BL_ROOT`, `BL_NOW`, `BL_NO_SYSTEMD`, `BL_FORCE_CRON`) sont
+  lues hors des tests. Un client distant ne peut pas les définir par défaut (`AcceptEnv` de
+  sshd), mais un shell d'administration qui les exporte les applique.
 
 ## 7. Périmètre des modifications
 

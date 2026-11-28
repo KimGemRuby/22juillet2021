@@ -271,6 +271,14 @@ wait_for() {
     return 0
 }
 
+# True while a process exists and is not a zombie (a killed child waiting to be
+# reaped does not count as running).
+process_alive() {
+    local state=''
+    state="$(awk '{ print $3 }' "/proc/$1/stat" 2>/dev/null || true)"
+    [[ -n "$state" && "$state" != Z ]]
+}
+
 # Real location of a tool. System directories first: a wrapper placed earlier
 # on PATH may need the rest of PATH to find the tool it wraps.
 real_tool() {
@@ -470,10 +478,12 @@ expect_eq 'unit directory holds the two units and no temporary file' \
 expect_absent 'no cron file' "$CRON_FILE"
 expect_eq 'systemctl never called, even with /run/systemd/system present' '' \
     "$(cat "$SYSTEMCTL_LOG")"
-if [[ "$HELPER" != "$ROOT"/* ]]; then
-    pass 'the path written in the unit is not prefixed by BL_ROOT'
+unit_exec="$(sed -n 's/^ExecStart=//p' "$UNIT_DIR/bokador-link-check.service")"
+if [[ -n "$unit_exec" && "$unit_exec" != "$ROOT"/* ]]; then
+    pass 'the ExecStart path read from the unit file is not prefixed by BL_ROOT'
 else
-    fail 'the path written in the unit is not prefixed by BL_ROOT' "helper: $HELPER"
+    fail 'the ExecStart path read from the unit file is not prefixed by BL_ROOT' \
+        "ExecStart: $unit_exec"
 fi
 
 before="$(snapshot "$ROOT")"
@@ -599,6 +609,8 @@ expect_match 'logger: tag bokador-link, up -> down' \
     '^-t bokador-link .*up -> down' "${logged[1]-}"
 expect_match 'logger: tag bokador-link, down -> up' \
     '^-t bokador-link .*down -> up' "${logged[2]-}"
+expect_match 'logger: the first transition names the client label of the heartbeat' \
+    'client : pc-1\)$' "${logged[0]-}"
 
 bl_at $((T0 + 700)) status
 expect_result 'clock earlier than the heartbeat: age reported as 0' 0 \
@@ -643,6 +655,17 @@ bl install
 install_hook 'if read -r -t 5 line; then echo "STDIN-HAD-DATA" >&2; else echo "STDIN-EMPTY" >&2; fi'
 bl_at "$T0" heartbeat pc-1
 expect_match 'hook: standard input is empty (/dev/null)' 'STDIN-EMPTY' "$ERR"
+
+# The hook reads the standard output of the helper: the contract line must
+# already be written when the hook runs.
+new_sandbox
+bl install
+install_hook "if grep -qx 'BOKADOR_LINK_OK $T0 up' $(printf '%q' "$TMP/stdout"); then echo CONTRACT-LINE-FIRST >&2; else echo CONTRACT-LINE-LATE >&2; fi"
+bl_at "$T0" heartbeat pc-1
+expect_result 'heartbeat: the contract line is written before the notify hook runs' 0 \
+    "BOKADOR_LINK_OK $T0 up"
+expect_match 'heartbeat: the notify hook finds the contract line already written' \
+    'CONTRACT-LINE-FIRST' "$ERR"
 
 # A stub "timeout" records the limit asked by the helper, then applies a
 # limit of 1 second so that the test stays fast.
@@ -952,7 +975,7 @@ section 'Choice of the scheduler by install (cron forced, cron fallback, systemd
 # ---------------------------------------------------------------------------
 
 new_sandbox
-mkdir -p "$ROOT/run/systemd/system"
+mkdir -p "$ROOT/run/systemd/system" "$ROOT/etc/cron.d"
 run_helper BL_FORCE_CRON=1 BL_NO_SYSTEMD=1 -- install
 expect_result 'BL_FORCE_CRON=1: stdout is exactly the success line' 0 \
     "BOKADOR_LINK_INSTALLED $VERSION"
@@ -987,12 +1010,23 @@ expect_eq 'switching scheduler with BL_NO_SYSTEMD=1 never calls systemctl' '' \
     "$(cat "$SYSTEMCTL_LOG")"
 
 new_sandbox
+mkdir -p "$ROOT/etc/cron.d"
 run_helper -- install
 expect_result 'no systemd detected: exit code 0' 0 "BOKADOR_LINK_INSTALLED $VERSION"
 expect_line 'no systemd detected: falls back to cron' "$CRON_FILE" \
     "*/5 * * * * root $HELPER check"
 expect_absent 'no systemd detected: no unit' "$UNIT_DIR/bokador-link-check.timer"
 expect_eq 'no systemd detected: systemctl never called' '' "$(cat "$SYSTEMCTL_LOG")"
+
+# Neither systemd nor /etc/cron.d: nothing can run the check, so install must
+# say so (exit 1, no success line) and leave the system as it was.
+new_sandbox
+run_helper -- install
+expect_result 'no systemd and no /etc/cron.d: install fails (exit 1) without the success line' 1 ''
+expect_absent 'no systemd and no /etc/cron.d: /etc/cron.d is not created' "$ROOT/etc/cron.d"
+expect_absent 'no systemd and no /etc/cron.d: no timer unit written' \
+    "$UNIT_DIR/bokador-link-check.timer"
+expect_eq 'no systemd and no /etc/cron.d: systemctl never called' '' "$(cat "$SYSTEMCTL_LOG")"
 
 new_sandbox
 mkdir -p "$ROOT/run/systemd/system" "$ROOT/etc/cron.d"
@@ -1022,6 +1056,7 @@ expect_result 'systemctl fails: install fails (exit 1) without the success line'
 new_sandbox
 mkdir -p "$ROOT/run/systemd/system"
 run_helper -- install
+mkdir -p "$ROOT/etc/cron.d"
 : > "$SYSTEMCTL_LOG"
 run_helper BL_FORCE_CRON=1 -- install
 expect_result 'BL_FORCE_CRON=1 on a systemd host: exit code 0' 0 "BOKADOR_LINK_INSTALLED $VERSION"
@@ -1067,6 +1102,7 @@ expect_eq 'uninstall: systemctl never called with BL_NO_SYSTEMD=1, even on a sys
     "$(cat "$SYSTEMCTL_LOG")"
 
 new_sandbox
+mkdir -p "$ROOT/etc/cron.d"
 run_helper BL_FORCE_CRON=1 BL_NO_SYSTEMD=1 -- install
 install_hook
 printf 'STALE_AFTER=120\n' > "$ETC_DIR/config"
@@ -1157,9 +1193,9 @@ else
     run_unprivileged version
     expect_result 'non-root, BL_ROOT empty: "version" still works' 0 "bokador-link $VERSION"
     run_unprivileged frobnicate
-    expect_result 'non-root, BL_ROOT empty: an unknown command is refused too (only "version" is exempt)' 3 ''
+    expect_result 'non-root, BL_ROOT empty: an unknown command is a usage error (exit code 2), checked before root' 2 ''
     run_unprivileged
-    expect_result 'non-root, BL_ROOT empty: no command is refused too' 3 ''
+    expect_result 'non-root, BL_ROOT empty: no command is a usage error (exit code 2)' 2 ''
     run_unprivileged version extra
     expect_result 'non-root, BL_ROOT empty: "version" with an extra argument is a usage error' 2 ''
 fi
@@ -1180,6 +1216,7 @@ make_minimal_path() {
 new_sandbox
 make_minimal_path "$TMP/min-bin"
 RUN_PATH="$TMP/min-bin"
+mkdir -p "$ROOT/etc/cron.d"
 run_helper -- install
 expect_result 'minimal PATH: install falls back to cron' 0 "BOKADOR_LINK_INSTALLED $VERSION"
 expect_line 'minimal PATH: cron line written' "$CRON_FILE" "*/5 * * * * root $HELPER check"
@@ -1253,6 +1290,43 @@ RUN_PATH="$TMP/min-bin"
 bl uninstall --purge
 expect_result 'minimal PATH: uninstall --purge' 0 'BOKADOR_LINK_UNINSTALLED'
 expect_absent 'minimal PATH: the helper removed itself' "$HELPER"
+RUN_PATH="$STUB_BIN:$BASE_PATH"
+
+# ---------------------------------------------------------------------------
+section 'Minimal PATH: a hook that leaves a child behind is stopped as a whole'
+# ---------------------------------------------------------------------------
+
+# Without "timeout" the helper signals the process group of the hook. The
+# child started by the hook (not only the hook itself) must be gone afterwards.
+new_sandbox
+make_minimal_path "$TMP/min-bin3"
+rm "$TMP/min-bin3/sleep"
+cat > "$TMP/min-bin3/sleep" <<EOF
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod 755 "$TMP/min-bin3/sleep"
+RUN_PATH="$TMP/min-bin3"
+bl install
+install_hook "$(printf '%q' "$REAL_SLEEP") 300 &
+printf '%s\n' \"\$!\" > $(printf '%q' "$TMP/grandchild.pid")
+exec $(printf '%q' "$REAL_SLEEP") 300"
+bl_at "$T0" heartbeat pc-1
+expect_result 'hook with a child: heartbeat still answers, exit code 0' 0 "BOKADOR_LINK_OK $T0 up"
+grandchild_pid="$(cat "$TMP/grandchild.pid" 2>/dev/null || true)"
+deadline=$((SECONDS + 5))
+while process_alive "$grandchild_pid" && (( SECONDS < deadline )); do
+    sleep 0.1
+done
+if [[ "$grandchild_pid" =~ ^[0-9]+$ ]] && ! process_alive "$grandchild_pid"; then
+    pass 'hook with a child: the child of the hook is stopped with the hook'
+else
+    fail 'hook with a child: the child of the hook is stopped with the hook' \
+        "child pid: ${grandchild_pid:-none}"
+    if [[ "$grandchild_pid" =~ ^[0-9]+$ ]]; then
+        kill -KILL "$grandchild_pid" 2>/dev/null || true
+    fi
+fi
 RUN_PATH="$STUB_BIN:$BASE_PATH"
 
 # ---------------------------------------------------------------------------

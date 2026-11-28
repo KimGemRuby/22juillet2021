@@ -193,19 +193,22 @@ run_limited() {
         timeout -k 5 "$limit" "$@" || rc=$?
         return "$rc"
     fi
-    # No "timeout" command: poll the child. Only the direct child is killed
-    # here (best effort), whereas timeout(1) signals its whole process group.
+    # No "timeout" command: poll the child. With job control the child gets a
+    # process group of its own, so that the whole group is signalled, as
+    # timeout(1) does, and not only the direct child.
     if sleep 0.1 2>/dev/null; then
         tick=0.1
         per_second=10
     fi
+    set -m
     "$@" &
     pid=$!
+    set +m
     while kill -0 "$pid" 2>/dev/null; do
         if (( ticks >= limit * per_second )); then
-            kill -TERM "$pid" 2>/dev/null || true
+            kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
             sleep 1
-            kill -KILL "$pid" 2>/dev/null || true
+            kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
             return 124
         fi
@@ -456,10 +459,6 @@ remove_units() {
 
 write_cron() {
     local content
-    if [[ ! -d "$CRON_DIR" ]]; then
-        warn "$CRON_DIR absent : cron ne semble pas installe, la verification periodique ne tournera pas sans lui"
-        mkdir -p -- "$CRON_DIR" || die 1 "creation impossible : $CRON_DIR"
-    fi
     content="# Ecrit par \"bokador-link install\" ; retire par \"bokador-link uninstall\".
 */5 * * * * root $SELF_PATH check"
     write_if_changed "$CRON_FILE" "$content"
@@ -520,6 +519,11 @@ cmd_install() {
 
     case "$scheduler" in
         cron)
+            # cron is taken to be installed when its directory exists. Checked
+            # before anything is changed: without it, nothing would run the check.
+            if [[ ! -d "$CRON_DIR" ]]; then
+                die 1 "$CRON_DIR absent : cron ne semble pas installe, verification periodique impossible"
+            fi
             remove_units
             write_cron
             warn "verification periodique : cron ($CRON_FILE)"
@@ -580,7 +584,10 @@ cmd_heartbeat() {
         write_atomic "$CLIENT_FILE" "$label"
     fi
     evaluate
-    # Answer first: a slow notify hook must not delay what the client reads.
+    # The contract line is written before the notify hook runs. The hook writes
+    # to the session's standard error, which keeps the ssh channel open: the
+    # client's ssh returns only when the hook has finished (at most
+    # BL_NOTIFY_LIMIT seconds).
     printf 'BOKADOR_LINK_OK %s %s\n' "$NOW" "$EVAL_STATE"
     announce
 }
@@ -642,8 +649,13 @@ main() {
     if [[ $# -gt 0 ]]; then
         shift
     fi
-    # The script refuses to run without root, "version" being the only
-    # exception (design section 5).
+    # An unknown command is a usage error whatever the privileges: it is
+    # checked before the root check (design section 5).
+    case "$command" in
+        version|install|uninstall|heartbeat|probe-port|status|check) ;;
+        *) usage_error ;;
+    esac
+    # Without BL_ROOT, every command but "version" needs root (exit code 3).
     if [[ "$command" != version ]]; then
         require_root
     fi

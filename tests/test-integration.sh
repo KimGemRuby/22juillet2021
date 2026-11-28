@@ -4,10 +4,14 @@
 #
 # A throwaway sshd is started on 127.0.0.1 (free high port, temporary host
 # key, temporary client key, its own AuthorizedKeysFile and PidFile). The
-# client side uses its own ssh_config, shaped like section 4.3 of the design.
-# The test then replays the exact remote command strings sent by the Windows
-# client: upload through stdin + install, heartbeat, status, probe-port,
-# a real reverse tunnel (ssh -N -R), a stale heartbeat, uninstall.
+# client ssh_config is written by hand below, key by key, as a copy of the
+# list of section 4.3 of the design: the PowerShell generator that makes the
+# real file cannot run here. A check below compares the keywords of this file
+# with section 4.3, and tests/ps-static-check.py compares the generator with
+# the same section. The test then replays the exact remote command strings
+# sent by the Windows client: upload through stdin + install, heartbeat,
+# status, probe-port, a real reverse tunnel (ssh -N -R), a stale heartbeat,
+# uninstall.
 #
 # Nothing leaves 127.0.0.1 and nothing outside the temporary directory is
 # written, except /run/sshd (empty privilege separation directory of sshd,
@@ -24,8 +28,10 @@ readonly SOURCE_HELPER="$REPO_ROOT/vps/bokador-link"
 readonly HOST_ALIAS='bokador-link-vps'
 readonly CLIENT_LABEL='BOKADOR-TEST'
 readonly HELPER_PATH_RE='^/[A-Za-z0-9/._-]{1,200}$'
-readonly SAFE_PATH_RE='^[A-Za-z0-9/._:+@-]+$'
 readonly STALE_SECONDS=3600
+# The client's ssh_config and the PATH given to the remote side are fixed here,
+# not taken from this machine's environment.
+readonly REMOTE_PATH_DIRS='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 
 PASSED=0
 FAILED=0
@@ -318,7 +324,6 @@ Host $HOST_ALIAS
     IdentitiesOnly yes
     BatchMode yes
     PasswordAuthentication no
-    KbdInteractiveAuthentication no
     StrictHostKeyChecking yes
     UserKnownHostsFile "$4" "$CLIENT_DIR/userprofile_known_hosts"
     ServerAliveInterval 30
@@ -492,10 +497,7 @@ cat > "$STUB_BIN/logger" <<EOF
 printf '%s\n' "\$*" >> $(printf '%q' "$TMP/logger.log")
 EOF
 chmod 755 "$STUB_BIN/logger"
-SETENV_LINE="SetEnv BL_ROOT=$VPS_ROOT BL_NO_SYSTEMD=1"
-if [[ "$PATH" =~ $SAFE_PATH_RE ]]; then
-    SETENV_LINE+=" PATH=$STUB_BIN:$PATH"
-fi
+SETENV_LINE="SetEnv BL_ROOT=$VPS_ROOT BL_NO_SYSTEMD=1 PATH=$STUB_BIN:$REMOTE_PATH_DIRS"
 readonly SETENV_LINE
 
 # ---------------------------------------------------------------------------
@@ -536,6 +538,18 @@ write_ssh_config "$CLIENT_DIR/ssh_config.wrong-key" "$SSHD_PORT" \
 write_ssh_config "$CLIENT_DIR/ssh_config.closed-port" "$CLOSED_PORT" \
     "$CLIENT_DIR/id_ed25519" "$CLIENT_DIR/known_hosts"
 
+# The keywords written above must be those of design section 4.3, in order:
+# the first word of each line of its code block.
+design_keywords="$(awk '
+    /^### 4\.3 / { in_section = 1; next }
+    /^### /       { in_section = 0 }
+    in_section && /^```/ { fence = !fence; next }
+    in_section && fence && NF > 0 { print $1 }
+' "$REPO_ROOT/docs/DESIGN.md")"
+config_keywords="$(awk 'NF > 0 { print $1 }' "$CLIENT_DIR/ssh_config")"
+expect_eq 'the client ssh_config has the keywords of design section 4.3, in the same order' \
+    "$design_keywords" "$config_keywords"
+
 ssh_run 'echo BOKADOR_LINK_OK'
 expect_result 'simple probe "echo BOKADOR_LINK_OK": key, host key and login work' 0 \
     'BOKADOR_LINK_OK'
@@ -544,23 +558,27 @@ if (( RC != 0 )); then
 fi
 
 # ---------------------------------------------------------------------------
-section 'ssh failures the client classifies (design section 4.4): exit 255 and stderr'
+section 'ssh failures: exit 255 and the stderr text that design section 4.4 classifies'
 # ---------------------------------------------------------------------------
+# Only the ssh side runs here: the classification itself (Get-BLClassifiedSshFailure)
+# is PowerShell and is not executed (design, section 6).
 
+kit_known_hosts_before="$(cksum < "$CLIENT_DIR/known_hosts")"
 ssh_with "$CLIENT_DIR/ssh_config.unknown-host" 'echo BOKADOR_LINK_OK'
-expect_ssh_failure 'unknown host key is refused (StrictHostKeyChecking yes): "hostkey"' \
+expect_ssh_failure 'unknown host key: stderr "Host key verification failed"' \
     'Host key verification failed'
 ssh_with "$CLIENT_DIR/ssh_config.changed-host" 'echo BOKADOR_LINK_OK'
-expect_ssh_failure 'changed host key is refused: "hostkey"' \
+expect_ssh_failure 'changed host key: stderr "REMOTE HOST IDENTIFICATION HAS CHANGED"' \
     'REMOTE HOST IDENTIFICATION HAS CHANGED'
 expect_match 'changed host key: also reports the verification failure' \
     'Host key verification failed' "$ERR"
 ssh_with "$CLIENT_DIR/ssh_config.wrong-key" 'echo BOKADOR_LINK_OK'
-expect_ssh_failure 'unauthorized key is refused, no password fallback: "auth"' 'Permission denied'
+expect_ssh_failure 'unauthorized key, no password fallback: stderr "Permission denied"' \
+    'Permission denied'
 ssh_with "$CLIENT_DIR/ssh_config.closed-port" 'echo BOKADOR_LINK_OK'
-expect_ssh_failure 'closed port: "network"' 'Connection refused'
-expect_eq 'none of these attempts touched the known_hosts of the kit' '1' \
-    "$(grep -c '' "$CLIENT_DIR/known_hosts")"
+expect_ssh_failure 'closed port: stderr "Connection refused"' 'Connection refused'
+expect_eq 'none of these attempts changed the known_hosts of the kit (content checksum)' \
+    "$kit_known_hosts_before" "$(cksum < "$CLIENT_DIR/known_hosts")"
 
 # ---------------------------------------------------------------------------
 section 'Upload through stdin, then install (design section 4.6, step 5)'
@@ -725,7 +743,8 @@ else
 fi
 
 mapfile -t notified < "$NOTIFY_LOG"
-expect_eq 'the notify hook was called once for the down transition' '2' "${#notified[@]}"
+expect_eq 'the notify hook has been called twice' '2' "${#notified[@]}"
+expect_eq 'the first call of the notify hook is "up 0"' '2|up|0' "${notified[0]-}"
 if [[ "${notified[1]-}" =~ ^2\|down\|([0-9]+)$ ]] \
     && (( BASH_REMATCH[1] >= check_before - stale_epoch && BASH_REMATCH[1] <= check_after - stale_epoch )); then
     pass 'the notify hook received "down <heartbeat age>"'
